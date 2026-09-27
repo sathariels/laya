@@ -1,0 +1,4 @@
+{
+  "name": "laya",
+  "install": "python3 -m pip install --user --break-system-packages --upgrade pip && python3 -m pip install --user --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu && python3 -m pip install --user --break-system-packages -e . && python3 -m pip install --user --break-system-packages ruff build twine"
+}
