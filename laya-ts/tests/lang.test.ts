@@ -1,6 +1,7 @@
 // laya-ts/tests/lang.test.ts
 import { describe, expect, it } from "vitest";
 import { analyse, detectScript, guessLatinLanguage, isEnglish } from "../src/lang.js";
+import { ENGLISH_LEXICON, ENGLISH_LEXICON_TEXT } from "../src/english-lexicon.js";
 describe("lang", () => {
   it("detects devanagari as non-latin", () => {
     expect(detectScript("मुझसे दो बार शुल्क लिया गया")).toBe("devanagari");
@@ -81,6 +82,72 @@ describe("lang", () => {
   });
   // `es` and `du` are German function words, but Spanish and French claim them, and a word two
   // lists share names neither language. They stay out of the German list.
+  // Undecided plain-ASCII of four or more words is not English (#54). Shorter text still is,
+  // and one English function word is enough to name English so the rule does not apply.
+  it("routes undecided plain-ASCII of four or more words off English", () => {
+    for (const text of [
+      "Fui cobrado duas vezes",
+      "lampen dimmen wohnzimmer abends",
+      "alpha bravo charlie delta",
+      "turn off wohnzimmer lights",
+    ]) {
+      const a = analyse(text);
+      expect(a.language, text).toBe(null);
+      expect(a.languageUndecided, text).toBe(true);
+      expect(a.diacriticRate, text).toBe(0);
+      expect(a.isEnglish, text).toBe(false);
+    }
+  });
+  it("keeps all-English-vocabulary commands on English", () => {
+    for (const text of [
+      "cancel my seven am alarm",
+      "play my rock playlist",
+      "turn off room lights",
+      "no refund no reply",
+      "tell me today's date",
+    ]) {
+      const a = analyse(text);
+      expect(a.language, text).toBe(null);
+      expect(a.isEnglish, text).toBe(true);
+      expect(a.languageUndecided, text).toBe(false);
+    }
+  });
+  it("keeps British-spelling commands on English", () => {
+    for (const text of [
+      "play my favourite playlist",
+      "play my favorite playlist",
+      "show my favourite songs",
+      "set living room colour warm",
+      "change lights colour blue",
+    ]) {
+      const a = analyse(text);
+      expect(a.isEnglish, text).toBe(true);
+      expect(a.languageUndecided, text).toBe(false);
+    }
+    expect(analyse("turn the colour of the lights to blue").language).toBe("en");
+  });
+  it("uses the generated lexicon in frequency order", () => {
+    const words = ENGLISH_LEXICON_TEXT.split(/\s+/).filter((w) => w.length > 0);
+    expect(words.slice(0, 5)).toEqual(["the", "of", "and", "to", "a"]);
+    expect(words.length).toBe(ENGLISH_LEXICON.size);
+    for (const w of ["colour", "favourite", "labour", "behaviour", "harbour", "organised",
+      "recognised", "customise", "analyses", "cox", "jo"]) {
+      expect(ENGLISH_LEXICON.has(w), w).toBe(true);
+    }
+    expect(ENGLISH_LEXICON.has("analyzes")).toBe(false);
+  });
+  it("keeps undecided plain-ASCII under four words on English", () => {
+    for (const text of ["alpha bravo charlie", "Quero cancelar", "refund me"]) {
+      const a = analyse(text);
+      expect(a.language, text).toBe(null);
+      expect(a.isEnglish, text).toBe(true);
+    }
+  });
+  it("keeps identified English on English", () => {
+    const a = analyse("I would like to book a flight to Berlin tomorrow");
+    expect(a.language).toBe("en");
+    expect(a.isEnglish).toBe(true);
+  });
   it("does not pull es or du into German", () => {
     expect(analyse("que hora es en australia").language).toBe("es");
     expect(analyse("baisse le volume du haut-parleur").language).toBe("fr");
@@ -109,5 +176,109 @@ describe("lang", () => {
     });
     expect(buried.isEnglish).toBe(false);
     expect(buried.language).toBe("de");
+  });
+
+  // mixed-segment detection (port of Python's _non_english_segment)
+  // A foreign line embedded in an English ticket must flip isEnglish and record the segment.
+  const TRACE = "I checked the refund status and here is what I found for the customer.\n" +
+    "The charge cleared last Tuesday and the bank confirmed it went through.\n" +
+    "Quero o meu dinheiro de volta agora mesmo porque já esperei demais\n" +
+    "Please escalate to the billing manager if the refund has not been issued by Friday.";
+
+  it("mixed-segment: Portuguese line in English ticket is not english", () => {
+    const a = analyse(TRACE);
+    expect(a.isEnglish).toBe(false);
+    expect(a.language).toBe("pt");
+    expect(a.mixedSegment).toBe(
+      "Quero o meu dinheiro de volta agora mesmo porque já esperei demais",
+    );
+  });
+
+  it("mixed-segment: German error payload in English ticket", () => {
+    const state = "The integration test failed with this error on the staging server " +
+      "and I am not sure whether it is a data issue or a code regression.\n" +
+      "Fehler: Die Verbindung zum Server wurde unterbrochen, bitte versuchen Sie es spaeter noch einmal";
+    const a = analyse(state);
+    expect(a.isEnglish).toBe(false);
+    expect(a.mixedSegment).toContain("Verbindung");
+  });
+
+  it("mixed-segment: Spanish error in structured state", () => {
+    const state = {
+      subject: "Payment failed for a customer in Madrid",
+      description: "The customer tried three times with the same card and each attempt was declined by " +
+        "the gateway, so we would like to know whether the problem is on our side or with the bank.",
+      error: {
+        code: "card_declined",
+        message: "La tarjeta fue rechazada por el banco emisor, contacte con su banco",
+      },
+    };
+    const a = analyse(state);
+    expect(a.isEnglish).toBe(false);
+    expect(a.mixedSegment).toContain("tarjeta");
+  });
+
+  it("mixed-segment: all-caps Portuguese line", () => {
+    const state =
+      "This is the fourth email I have sent about the same order and nobody has answered any of them.\n" +
+      "The customer wrote this in the chat and then closed the window:\n" +
+      "QUERO MEU DINHEIRO DE VOLTA AGORA\n" +
+      "Could someone from the billing team look at order 5512 today?";
+    const a = analyse(state);
+    expect(a.isEnglish).toBe(false);
+    expect(a.mixedSegment).toBe("QUERO MEU DINHEIRO DE VOLTA AGORA");
+  });
+
+  // English stays English: multi-line, short foreign sign-off, code lines
+  it.each([
+    ["multi-line english", "Hi team,\nThe export failed again last night.\nCan you check the logs?\nThanks"],
+    ["short portuguese sign-off", "Please resend the invoice for March, the amount is wrong.\nAtenciosamente, Joao"],
+    ["os.path", "The build broke after the refactor.\nREPO = os.path.dirname(os.path.dirname(__file__))\n" +
+      "Please take a look at the import paths when you can."],
+    ["round(el)", "The latency script crashes on large runs.\nmix[key] = {\"total_s\": round(el, 2)}\n" +
+      "Can you check why the stream is empty?"],
+    ["same word twice (Nav/Com)", "I'm looking for good deals on the following (used or new):\n" +
+      "Aviation Headsets (with mic).\n" +
+      "Handheld Nav/Com tranciever (may consider COM only).\nPortable GPS or Loran Navigator."],
+    ["team codes", "Round two predictions for the pool, as promised.\nQUE  vs MON:  MON  in 7.\n" +
+      "PIT  vs NYI:  PIT  in 5."],
+    ["slash compound", "I need a converter for these image formats.\n" +
+      "DOS, OS/2 or platform independent programs if possible.\nThanks in advance."],
+    ["backslash path", "My modem stopped answering after the upgrade.\nC:\\DOS\\mode COM1:9600,n,8,1,p\n" +
+      "Is that the right line for a 9600 baud connection?"],
+  ])("mixed-segment english stays english: %s", (_label, state) => {
+    expect(analyse(state).isEnglish).toBe(true);
+    expect(analyse(state).mixedSegment).toBeNull();
+  });
+
+  // The segment check reads at most 4000 chars, so a foreign line past that cap is not seen.
+  it("mixed-segment: segment check reads at most the cap", () => {
+    const state = {
+      log: "The export failed again last night for the whole region. ".repeat(80),
+      body: "Quero cancelar meu plano agora mesmo",
+    };
+    expect(analyse(state).mixedSegment).toBeNull();
+  });
+
+  it.each([
+    "Please send me the café menu today please",
+    "Could you email me your résumé before the meeting",
+    "Send the invoice to José before Friday",
+    "We visited Zürich last summer and loved it",
+  ])("keeps English with one accented loanword English: %s", (text) => {
+    expect(guessLatinLanguage(text)).toBe("en");
+    expect(isEnglish(text)).toBe(true);
+  });
+
+  it.each<[string, string | null]>([
+    ["Grüße aus Köln, wir melden uns wegen der Rechnung", "de"],
+    ["sluk lyset i soveværelset", null],
+    ["kan jeg få en refundering for det dobbelte beløb", null],
+    ["stäng av ljuset i sovrummet", null],
+    ["jag vill ha en återbetalning för den dubbla avgiften", "sv"],
+    ["The naïve façade needs a fresh coat of paint", null],
+  ])("does not rescue accented non-English text: %s", (text, language) => {
+    expect(guessLatinLanguage(text)).toBe(language);
+    expect(isEnglish(text)).toBe(false);
   });
 });

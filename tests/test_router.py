@@ -197,6 +197,70 @@ _de_long = {
 check("route/dict german after long english note", _r_de.route(_de_long, {}).model, "multilingual")
 check("route/dict german after long english note names de",
       _r_de.route(_de_long, {})["detection"]["language"], "de")
+# The leaf scan #384 added runs a full `_analyse_text` pass on every line of every value. A line
+# too short to be selected is now skipped before that happens. The #384 checks above pin the
+# answers; these add the cost side, the constant itself, and the invariant a cheaper scan must
+# not trade away.
+#
+# Ratios to prose of the same size, never wall-clock, so a loaded runner inflates both sides.
+# Warm-up then best of nine: the numerators are ~2 ms windows against a ~24 ms denominator, and
+# at five reps a single descheduled run moved the 10 000-field ratio to 0.385. Nine reps holds it.
+# Previous / ceiling / current, each ceiling the geometric mean of the pair it separates:
+#   one-char lines, 50 000 chars       2.85 / 0.80 / 0.23
+#   six-char lines, 50 000 chars       1.24 / 0.35 / 0.10
+#   10 000 six-character fields        1.85 / 0.68 / 0.25
+# Worst current ratio over six trials was 0.232 / 0.098 / 0.249 idle and 0.231 / 0.097 / 0.246
+# with twelve busy processes on the box, so every ceiling keeps at least 2.7x of room under load;
+# reverting gives 3.19 / 1.25 / 2.27 under that same load, 3.3x or more the other way. The
+# measured ratio goes in the check name, so a red CI log says what it was, not only "got False".
+def _ms(state, reps=9):
+    analyse(state)
+    analyse(state)
+    best = float("inf")
+    for _ in range(reps):
+        t = _time.perf_counter()
+        analyse(state)
+        best = min(best, _time.perf_counter() - t)
+    return best * 1000
+
+
+# Prose LINES, not one long line: `_leaf_non_english` slices each line to 4000 characters, so a
+# 50 000-character one-liner does a fraction of the work and would be a meaningless denominator
+# (2.2 ms against 24.1 ms for the same characters as lines). Every state here is a dict on
+# purpose: `analyse` returns a plain string's verdict before the leaf scan runs.
+_PROSE_50K = {"body": "\n".join(["The customer was billed twice and wants a refund."] * 1020)[:50_000]}
+_prose_ms = _ms(_PROSE_50K)
+for _name, _state, _ceiling in (
+    ("one-char lines", {"body": ("a\n" * 25_000)[:50_000]}, 0.80),
+    ("six-char lines", {"body": ("abcdef\n" * 7_142)[:50_000]}, 0.35),
+    ("10k six-char fields", {"f%d" % i: "abcdef" for i in range(10_000)}, 0.68),
+):
+    _ratio = _ms(_state) / _prose_ms
+    check("leaf scan/%s vs prose = %.2f, ceiling %.2f" % (_name, _ratio, _ceiling),
+          _ratio < _ceiling, True)
+
+# The constant. Seven is the largest sound threshold: each branch of `_leaf_non_english` needs
+# four `_WORD` tokens -- maximal runs of letters and letter-like numerals, so four need three
+# separators between them -- or ten letters. "é à ü ö" is exactly seven characters and four
+# tokens, and must still be read: this is the check that pins the threshold, and raising it to 8
+# turns that check red. "é à üö" is six characters and three tokens; no six-character line can be
+# selected at any threshold, so that check is a behaviour pin rather than a second bound -- it
+# passes on unguarded code too, and is here to catch a future change that makes short lines
+# selectable. Both values sit past 4000 characters of English, which is what makes the leaf scan
+# the code under test: before that the segment scan has already answered.
+_EN_PAST_SEGMENT_CAP = "The customer was billed twice and wants a refund. " * 120
+check("leaf scan/a 7-character foreign line is still read",
+      analyse({"note": _EN_PAST_SEGMENT_CAP, "msg": "é à ü ö"})["is_english"], False)
+check("leaf scan/a 6-character line stays English",
+      analyse({"note": _EN_PAST_SEGMENT_CAP, "msg": "é à üö"})["is_english"], True)
+
+# #384's invariant, which a budget shared across the state would break: a long earlier value must
+# not stop a later one from being read. Cheap to keep, and it is the one way a future attempt to
+# bound this scan by total characters would go wrong silently -- the state below would route to
+# the English checkpoint, which BENCHMARKS.md shows collapsing off English.
+check("leaf scan/a later value is still read after a 50k earlier one",
+      analyse({"pad": "x " * 25_000, "msg": "我们三月份被重复收费了两次。"})["is_english"], False)
+
 from collections import UserDict  # noqa: E402
 from types import MappingProxyType  # noqa: E402
 check("route/userdict german", _r_de.route(UserDict({"message": _DE}), {}).model, "multilingual")
@@ -364,13 +428,13 @@ check("route/english still english",
       _r_lat.route("Please refund the duplicate charge on invoice 4411 today.").model, "english")
 check("route/short english still english", _r_lat.route("refund me").model, "english")
 
-# Undecided Latin text follows `default`, as a state with no letters already did. Short messages made
-# only of content words carry nothing that names their language, and hard-coding English for them
-# sent every short Portuguese message to the checkpoint that is 0.97 confident at 0.47 accuracy on
-# `pt`, whatever the router was configured with.
+# Undecided Latin text under four words follows `default`, as a state with no letters already did.
+# The stopword heuristic skips anything shorter, so the text carries nothing that names a language,
+# and hard-coding English for it sent every short Portuguese message to the checkpoint that is 0.97
+# confident at 0.47 accuracy on `pt`, whatever the router was configured with. Four or more words
+# are a different call (#54) and are pinned further down.
 _r_ml = Router(default="multilingual")
-for text in ["Quero cancelar", "Esqueci minha senha", "Fui cobrado duas vezes",
-             "Produto veio quebrado, quero trocar", "refund me"]:
+for text in ["Quero cancelar", "Esqueci minha senha", "refund me"]:
     check("route/undecided follows default " + text[:24], _r_ml.route(text).model, "multilingual")
     check("route/undecided stock default " + text[:24], _r_lat.route(text).model, "english")
 check("route/undecided reason names the default",
@@ -508,16 +572,16 @@ for lang, text in [
 ]:
     check("route/accented " + lang, _r_lat.route(text).model, "multilingual")
 
-# English must not move for this. The added words are ordinary English tokens as well -- `de facto`,
-# `et al.`, `e.g.`, `la carte`, `UN`, `MI5`, `DOS` -- and a state carrying none of them is the case
-# that has to keep routing to English.
+# English the heuristic names must not move for this. The added words are ordinary English tokens
+# as well -- `de facto`, `et al.`, `e.g.`, `la carte`, `UN`, `MI5`, `DOS`. A four-word command
+# with no function word ("no refund no reply") is still English vocabulary, so the #54 exception
+# keeps it on English; that case is pinned below.
 for text in [
     "The customer was charged twice and wants a refund for this invoice",
     "Please cancel my subscription and refund the duplicate charge today",
     "The report by Smith et al. shows the de facto standard, e.g. the LA office and Rio",
     "Our MI5 and UN contacts discussed the DOS attack in LA last month",
     "No refund was issued, so I am writing to you again about invoice 4411",
-    "no refund no reply",
     "The son of the director filed a complaint about the duplicate invoice",
 ]:
     check("is_english/romance control " + text[:32], is_english(text), True)
@@ -631,6 +695,130 @@ for text in ["turn off smart lamp in den", "im so sorry, am an hour late, stuck 
 check("latin_lang/spanish es stays evidence", guess_latin_language("que hora es en australia"), "es")
 check("latin_lang/french du stays evidence", guess_latin_language("baisse le volume du haut-parleur"), "fr")
 
+# --------------------------------------------------------------------- undecided plain-ASCII (#54)
+# Path 2 above is German the stopword list names. Path 1 is what the lists do not name and that
+# has no non-English letter. On #54 the maintainer chose multilingual at four or more words.
+# On #600 that rule gains an exception: if every word is English vocabulary, stay on English.
+# The four-word gate is the same one `latin_profile` already uses before it will name a language.
+for text in ["Fui cobrado duas vezes",
+             "Produto veio quebrado, quero trocar",
+             "lampen dimmen wohnzimmer abends",
+             "alpha bravo charlie delta",
+             # one word from outside the vocabulary is enough
+             "turn off wohnzimmer lights"]:
+    det = analyse(text)
+    check("undecided4/language " + text, det["language"], None)
+    check("undecided4/flagged " + text, det["language_undecided"], True)
+    check("undecided4/no diacritics " + text, det["diacritic_rate"], 0.0)
+    check("undecided4/not english " + text, det["is_english"], False)
+    check("undecided4/route " + text, _r_lat.route(text).model, "multilingual")
+    # not via `default`: a multilingual default and the stock default agree
+    check("undecided4/ignores default " + text, _r_ml.route(text).model, "multilingual")
+check("undecided4/reason names the rule",
+      _r_lat.route("Fui cobrado duas vezes").reason,
+      "Latin script, language not identified; four or more words and no "
+      "non-English letters, not safe for the English checkpoint")
+# three words is still the short case, including a token string no list will ever claim
+for text in ["alpha bravo charlie", "Quero cancelar", "Esqueci minha senha", "refund me"]:
+    det = analyse(text)
+    check("undecided-short/language " + text, det["language"], None)
+    check("undecided-short/english " + text, det["is_english"], True)
+    check("undecided-short/stock route " + text, _r_lat.route(text).model, "english")
+# one English function word names the language, so the four-word rule does not apply
+check("undecided4/identified english",
+      analyse("I would like to book a flight to Berlin tomorrow")["language"], "en")
+check("undecided4/identified english route",
+      _r_lat.route("I would like to book a flight to Berlin tomorrow").model, "english")
+check("undecided4/one english hit stays english",
+      _r_lat.route("turn off smart lamp in den").model, "english")
+# 4-5 word commands with no stopword hit, but every word in the English lexicon (#600)
+for text in ["cancel my seven am alarm",
+             "play my rock playlist",
+             "turn off room lights",
+             "no refund no reply",
+             "tell me today's date"]:
+    det = analyse(text)
+    check("lexicon/language " + text, det["language"], None)
+    check("lexicon/english " + text, det["is_english"], True)
+    check("lexicon/not the short-text default " + text, det["language_undecided"], False)
+    check("lexicon/route " + text, _r_lat.route(text).model, "english")
+    check("lexicon/ignores default " + text, _r_ml.route(text).model, "english")
+# British spellings are in the lexicon too: the favourite/favorite pair must route alike, and
+# colour, labour, organised etc. were once hand-removed from the list (review on #600).
+for text in ["play my favourite playlist",
+             "play my favorite playlist",
+             "show my favourite songs",
+             "set living room colour warm",
+             "change lights colour blue"]:
+    det = analyse(text)
+    check("lexicon/british english " + text, det["is_english"], True)
+    check("lexicon/british not undecided " + text, det["language_undecided"], False)
+    check("lexicon/british route " + text, _r_lat.route(text).model, "english")
+    check("lexicon/british ignores default " + text, _r_ml.route(text).model, "english")
+for text in ["turn the colour of the lights to blue", "what time does the harbour open"]:
+    check("lexicon/british named " + text, analyse(text)["language"], "en")
+    check("lexicon/british named route " + text, _r_lat.route(text).model, "english")
+
+# The lexicon is generated by scripts/build_english_lexicon.py from a pinned count_1w.txt. CI has
+# no network, so these check what the generator guarantees without re-downloading the source:
+# both files are its rendering of the same frequency-ordered list, one-letter tokens are only
+# a/i, every EXCLUDED word is absent and nothing else from the old hand-curated removals is.
+import importlib.util  # noqa: E402
+from laya import english_lexicon as _lex_mod  # noqa: E402
+from laya.english_lexicon import ENGLISH_LEXICON  # noqa: E402
+_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+_spec = importlib.util.spec_from_file_location(
+    "build_english_lexicon", os.path.join(_root, "scripts", "build_english_lexicon.py"))
+_build = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_build)
+_py_lex_text = open(_lex_mod.__file__, encoding="utf-8").read()
+_ts_lex = open(os.path.join(_root, "laya-ts", "src", "english-lexicon.ts"), encoding="utf-8").read()
+_py_words = _py_lex_text.split('ENGLISH_LEXICON = frozenset(\n    """')[1].split('"""')[0].split()
+_lex_at = _ts_lex.index("ENGLISH_LEXICON_TEXT = `") + len("ENGLISH_LEXICON_TEXT = `")
+_ts_words = _ts_lex[_lex_at:_ts_lex.index("`", _lex_at)].split()
+check("lexicon/ts matches python", frozenset(_ts_words), ENGLISH_LEXICON)
+check("lexicon/ts order matches python", _ts_words, _py_words)
+check("lexicon/python list is the set", frozenset(_py_words), ENGLISH_LEXICON)
+check("lexicon/no duplicates", len(_py_words), len(ENGLISH_LEXICON))
+check("lexicon/python file is generator output", _py_lex_text, _build.render_python(_py_words))
+check("lexicon/ts file is generator output", _ts_lex, _build.render_ts(_py_words))
+check("lexicon/frequency order, not sorted", _py_words[:5], ["the", "of", "and", "to", "a"])
+check("lexicon/one-letter tokens", sorted(w for w in ENGLISH_LEXICON if len(w) == 1), ["a", "i"])
+check("lexicon/excluded words absent", sorted(_build.EXCLUDED & ENGLISH_LEXICON), [])
+# 9,976 words survive the top-10,000 and one-letter rules; EXCLUDED is the only other removal.
+check("lexicon/size", len(ENGLISH_LEXICON), 9976 - len(_build.EXCLUDED))
+check("lexicon/exclusion list size", len(_build.EXCLUDED), 86)
+# `analyzes` is rank 19,294, outside the top 10,000; the plural-s rule covers it from `analyze`.
+check("lexicon/analyzes not stored", "analyzes" in ENGLISH_LEXICON, False)
+from laya.lang import _english_lexicon_word  # noqa: E402
+check("lexicon/analyzes via plural rule", _english_lexicon_word("analyzes"), True)
+for word in ["colour", "colours", "favour", "favourite", "favourites", "labour", "behaviour",
+             "harbour", "organised", "recognised", "customise", "analyses", "cox", "jo", "wang",
+             "god", "hell", "damn", "bloody", "crap", "balls", "butt", "escort", "breasts", "sex",
+             "sexy", "hardcore", "squirt", "suck", "sucks", "xx"]:
+    check("lexicon/restored " + word, word in ENGLISH_LEXICON, True)
+# a non-English letter keeps the diacritic rule. Under the 0.02 floor this stays English;
+# the four-word rule is only for text with no such letter.
+_LOW_DIAC = "alpha bravo charlie delta echo foxtrot golf hotel café"
+_low = analyse(_LOW_DIAC)
+check("undecided4/low diacritic stays undecided", _low["language"], None)
+check("undecided4/low diacritic rate under the floor",
+      0.0 < _low["diacritic_rate"] < 0.02, True)
+check("undecided4/low diacritic stays english", _low["is_english"], True)
+check("undecided4/low diacritic stock route", _r_lat.route(_LOW_DIAC).model, "english")
+# an English ticket is not flipped by one undecided field; the leaf scan still wants a
+# named language or a real diacritic rate
+check("undecided4/english ticket keeps an undecided field",
+      _r_lat.route({"body": "Please refund the duplicate charge on invoice 4411 today.",
+                    "note": "Fui cobrado duas vezes"}).model, "english")
+# a non-Latin field that does not win the script vote is still multilingual, and the reason
+# stays the letter one: the four-word wording is only for plain ASCII
+_buried_han = {"body": "Please refund the duplicate charge on invoice 4411 today. " * 5,
+               "message": "我的订单已经两个星期了还没有到"}
+check("undecided4/buried non-latin still multilingual", _r_lat.route(_buried_han).model, "multilingual")
+check("undecided4/buried non-latin is not the four-word reason",
+      "four or more words" not in _r_lat.route(_buried_han).reason, True)
+
 # ------------------------------------------------------------------ accented loanwords in English (#337)
 # The diacritic rate is measured over every character, so one `é` in a short English sentence
 # clears the 0.02 floor and used to veto the English resolution outright: plain English with a
@@ -650,16 +838,74 @@ check("latin_lang/accented german stays non-english",
       is_english("Grüße aus Köln, wir melden uns wegen der Rechnung"), False)
 check("route/accented german stays multilingual",
       _r_lat.route("Grüße aus Köln, wir melden uns wegen der Rechnung").model, "multilingual")
-# Danish and Swedish hold no list here, and their accented function-word sentences pick up just
-# one or two English-shaped words (`i`, `at`, `for`, `have`), which is not the two-distinct-word
-# English the rescue requires -- a rescue that counted them sent plain Danish to the English
-# checkpoint on the MASSIVE splits.
+# Danish still has no list here, and its accented sentences pick up just one or two English-shaped
+# words (`i`, `at`, `for`, `have`), which is not the two-distinct-word English the rescue requires.
 for text in ["sluk lyset i soveværelset",                          # da
              "kan jeg få en refundering for det dobbelte beløb",   # da
-             "stäng av ljuset i sovrummet",                         # sv
-             "jag vill ha en återbetalning för den dubbla avgiften"]:  # sv
+             "stäng av ljuset i sovrummet"]:                        # sv
     check("latin_lang/nordic accented stays non-english " + text, is_english(text), False)
     check("route/nordic accented stays multilingual " + text, _r_lat.route(text).model, "multilingual")
+
+# Swedish-specific words now identify both normal text and ASCII-normalised support prose. The
+# second sample is the real false-negative shape: `få` alone was too weak to stop its two English-
+# shaped words (`i`, `kan`) from pulling the request onto the English checkpoint.
+for text in ["Om ni inte kan få tillbaka de raderade filerna i dag avslutar jag mitt abonnemang.",
+             "Om ni inte kan fa tillbaka de raderade filerna i dag avslutar jag mitt abonnemang.",
+             "jag vill att ni hjalper mig med detta"]:
+    check("latin_lang/swedish is named " + text, guess_latin_language(text), "sv")
+    check("route/swedish uses multilingual " + text, _r_lat.route(text).model, "multilingual")
+    check("route/swedish detection reports sv " + text, _r_lat.route(text)["detection"]["language"], "sv")
+# Common Swedish support phrasing should identify the language across billing, account, technical
+# and delivery messages, both with and without Swedish diacritics.
+for text in ["Kan ni hjälpa mig?", "Min faktura är fel", "Jag behöver hjälp med betalningen",
+             "Kan ni skicka kvittot igen?", "Jag vill byta lösenord",
+             "Appen kraschar när jag öppnar inställningarna",
+             "Var hittar jag inställningen för tvåfaktorsinloggning?",
+             "Vi har debiterats två gånger för mars",
+             "Var är mitt paket? Spårningen har inte uppdaterats"]:
+    check("latin_lang/swedish support is named " + text, guess_latin_language(text), "sv")
+    check("route/swedish support uses multilingual " + text,
+          _r_lat.route(text).model, "multilingual")
+for text in ["min faktura ar fel", "jag behover hjalp med betalningen",
+             "kan ni skicka kvittot igen", "jag vill byta losenord",
+             "appen kraschar nar jag oppnar installningarna",
+             "var hittar jag installningen for tva faktorsinloggning",
+             "vi har blivit debiterade tva ganger for mars",
+             "var ar mitt paket sparningen har inte uppdaterats"]:
+    check("latin_lang/ascii swedish support is named " + text, guess_latin_language(text), "sv")
+    check("route/ascii swedish support uses multilingual " + text,
+          _r_lat.route(text).model, "multilingual")
+# Short login failures often contain English technical vocabulary and can arrive without Swedish
+# diacritics. Swedish `kan` + `inte` must outweigh the incidental English token `in`.
+for text in ["Kan inte logga in", "kan inte logga in", "Jag kan inte logga in", "Vi kan inte logga in"]:
+    check("latin_lang/short swedish login is named " + text, guess_latin_language(text), "sv")
+    check("route/short swedish login uses multilingual " + text,
+          _r_lat.route(text).model, "multilingual")
+    check("route/short swedish login detection reports sv " + text,
+          _r_lat.route(text)["detection"]["language"], "sv")
+# Two- and three-word Swedish support fragments do not reach the general four-word evidence
+# threshold. Only distinctly Swedish terms should name them; generic words and Nordic controls
+# remain undecided rather than being guessed as Swedish.
+for text in ["Ingen åtkomst", "Ingen atkomst", "Fakturan är fel", "Betalningen nekades",
+             "Behöver hjälp", "Behover hjalp", "Glömt lösenord", "Glomt losenord",
+             "Felmeddelande igen", "Kvitto saknas", "Inloggningen fungerar"]:
+    check("latin_lang/short Swedish support is named " + text, guess_latin_language(text), "sv")
+    check("route/short Swedish support uses multilingual " + text,
+          _r_lat.route(text).model, "multilingual")
+    check("route/short Swedish support detection reports sv " + text,
+          _r_lat.route(text)["detection"]["language"], "sv")
+for text in ["Ingen adgang", "Fakturaen feil", "Glemt passord", "Pakken forsinket",
+             "No account access", "Password forgotten"]:
+    check("latin_lang/short non-Swedish stays undecided " + text,
+          guess_latin_language(text), None)
+check("latin_lang/english login stays english",
+      guess_latin_language("I cannot login to my account"), "en")
+check("route/english login stays english",
+      _r_lat.route("I cannot login to my account").model, "english")
+check("latin_lang/danish login is not called swedish",
+      guess_latin_language("Jeg kan ikke logge inn"), None)
+check("latin_lang/danish account login is not called swedish",
+      guess_latin_language("Jeg kan ikke logge ind på min konto"), None)
 # Two non-English-letter words is a running non-English vocabulary, not one loanword: the rescue
 # does not fire even with English function words present.
 check("latin_lang/two diacritic words are not one loanword",
@@ -680,6 +926,8 @@ check("clamp/none falls back to neutral", clamp_temperature(None), 1.0)
 check("clamp/garbage falls back to neutral", clamp_temperature("x"), 1.0)
 check("clamp/nan falls back to neutral", clamp_temperature(float("nan")), 1.0)
 check("clamp/inf falls back to neutral", clamp_temperature(float("inf")), 1.0)
+check("clamp/bools are not temperatures", clamp_temperature(True), 1.0)
+check("clamp/False is not a sharpening zero", clamp_temperature(False), 1.0)
 check("clamp/bounds are sane", TEMP_MIN <= 1.0 <= TEMP_MAX, True)
 # 13 options is the bucket the reported skill-router landed in
 check("clamp/13 options is the 11+ bucket", temp_bucket(QTYPES["choice"], 13), "choice:11+")
